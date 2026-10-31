@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+# OpenRC version of privacy-lock-login.service: lift the restart-lifted blocks
+# at the first local login (needs elogind for loginctl).
+
+description="privacy-lock: lift restart-lifted camera/mic blocks at the first login"
+command="/usr/local/sbin/privacy-lock"
+command_args="wait-login"
+command_background=true
+pidfile="/run/privacy-lock-login.pid"
+
+depend() {
+    need privacy-lock-boot elogind
+}

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Entry point for the tray's first step, run through pkexec without a password:
+# it only checks the PIN (wrong PINs count toward the lockout), so a wrong PIN
+# is refused before the system asks for the computer password.
+[ $# -eq 0 ] || { echo "Not allowed." >&2; exit 1; }
+exec /usr/local/sbin/privacy-lock --gui-check check-pin

@@ -1,0 +1,10 @@
+[Unit]
+Description=privacy-lock: lift restart-lifted camera/mic blocks at the first login
+After=privacy-lock-boot.service systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/privacy-lock wait-login
+
+[Install]
+WantedBy=multi-user.target

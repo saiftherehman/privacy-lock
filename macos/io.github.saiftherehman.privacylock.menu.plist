@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.saiftherehman.privacylock.menu</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Application Support/privacy-lock/venv/bin/python3</string>
+        <string>/Library/Application Support/privacy-lock/privacy_lock_tray.py</string>
+    </array>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Always come back if it is closed, killed or crashes. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>2</integer>
+</dict>
+</plist>

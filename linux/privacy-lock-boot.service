@@ -1,0 +1,11 @@
+[Unit]
+Description=privacy-lock: re-apply camera/mic blocks at boot
+After=systemd-udevd.service systemd-modules-load.service alsa-restore.service
+Before=display-manager.service systemd-user-sessions.service getty.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/privacy-lock boot
+
+[Install]
+WantedBy=multi-user.target

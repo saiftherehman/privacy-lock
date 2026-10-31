@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+# OpenRC version of privacy-lock-boot.service: re-apply the camera/mic blocks
+# from before the restart, before the login screen starts.
+
+description="privacy-lock: re-apply camera/mic blocks at boot"
+
+depend() {
+    need udev localmount
+    after modules alsasound
+    before xdm display-manager agetty
+}
+
+start() {
+    ebegin "Re-applying camera/mic blocks"
+    /usr/local/sbin/privacy-lock boot
+    eend $?
+}

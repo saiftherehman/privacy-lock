@@ -1,0 +1,5 @@
+# Keep Linux and macOS scripts with LF endings, even when cloned on Windows.
+* text=auto eol=lf
+# Windows scripts need CRLF.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf

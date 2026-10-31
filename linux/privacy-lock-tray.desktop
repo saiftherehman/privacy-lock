@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Camera & Mic Lock
+Comment=Block or unblock the camera and microphone with a PIN
+Exec=/usr/local/bin/privacy-lock-tray
+Icon=changes-prevent-symbolic
+Categories=Utility;Security;System;
+Keywords=camera;webcam;microphone;privacy;lock;

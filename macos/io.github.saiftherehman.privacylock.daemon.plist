@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.saiftherehman.privacylock.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Application Support/privacy-lock/venv/bin/python3</string>
+        <string>/Library/Application Support/privacy-lock/privacy_lock_daemon.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Turn off removes the daemon from a child process, which must outlive it. -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/privacy-lock.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/privacy-lock.log</string>
+</dict>
+</plist>

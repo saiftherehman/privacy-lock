@@ -1,0 +1,10 @@
+#!/bin/sh
+# Entry point for "Set up PIN" / "Change PIN" / "Forgot PIN" / "Turn off" in the tray,
+# run through pkexec.
+# The system asks for the user's own computer password every time before this
+# runs (see io.github.saiftherehman.privacylock.policy). PINs arrive from the tray on stdin.
+case "$1" in
+    setup|change-pin|reset-pin|remove) ;;
+    *) echo "Not allowed." >&2; exit 1 ;;
+esac
+exec /usr/local/sbin/privacy-lock --gui-pin "$1"

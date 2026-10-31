@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <action id="io.github.saiftherehman.privacylock.toggle">
+    <description>Block or unblock the camera and microphone</description>
+    <message>Enter your computer password to block or unblock the camera and microphone</message>
+    <icon_name>changes-prevent-symbolic</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <!-- Two-step check: the user's own password every time (never remembered),
+           then the PIN, checked by the engine. -->
+      <allow_active>auth_self</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/privacy-lock-helper</annotate>
+  </action>
+  <action id="io.github.saiftherehman.privacylock.checkpin">
+    <description>Check the camera and microphone PIN</description>
+    <message>Camera &amp; Mic Lock needs permission to check your PIN</message>
+    <icon_name>changes-prevent-symbolic</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <!-- No password: it only checks the PIN, limited by the wrong-PIN lockout. -->
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/privacy-lock-pin-check</annotate>
+  </action>
+  <action id="io.github.saiftherehman.privacylock.pin">
+    <description>Set up, change, reset or remove the camera and microphone PIN</description>
+    <message>Enter your computer password to set up, change, reset or turn off the Camera &amp; Mic Lock PIN</message>
+    <icon_name>changes-prevent-symbolic</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <!-- Always ask for the user's own password, never remembered. -->
+      <allow_active>auth_self</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/privacy-lock-pin-helper</annotate>
+  </action>
+</policyconfig>

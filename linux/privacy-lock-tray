@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""Top-bar (tray) menu for privacy-lock: block / unblock the camera and the mic."""
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Notify", "0.7")
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+except (ValueError, ImportError):
+    # Some distributions (e.g. Fedora, openSUSE) may only ship the older library.
+    gi.require_version("AppIndicator3", "0.1")
+    from gi.repository import AppIndicator3 as AppIndicator  # noqa: E402
+from gi.repository import Gio, GLib, Gtk, Notify  # noqa: E402
+
+APP_ID = "privacy-lock"
+CLI = "/usr/local/sbin/privacy-lock"
+HELPER = "/usr/local/libexec/privacy-lock-helper"
+PIN_HELPER = "/usr/local/libexec/privacy-lock-pin-helper"
+PIN_CHECK = "/usr/local/libexec/privacy-lock-pin-check"
+EXIT_LOCKED_OUT = 4
+PIN_FILE = "/etc/privacy-lock/pin.json"
+MIN_PIN_LEN = 4
+STATE_FILE = "/run/privacy-lock/state.json"
+BOOT_NOTICE = "/run/privacy-lock/boot-notice.json"
+# Per-login marker (XDG_RUNTIME_DIR is emptied when the user fully logs out),
+# so the status pops up once per login even if the menu itself restarts.
+LOGIN_MARKER = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+                            "privacy-lock-login-notified")
+NOTIFIED_FILE = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "privacy-lock", "notified-boot")
+
+NAMES = {"camera": "Camera", "mic": "Microphone"}
+ICONS = {
+    # (camera blocked, mic blocked) -> top-bar icon
+    (False, False): "changes-allow-symbolic",
+    (True, False): "camera-disabled-symbolic",
+    (False, True): "microphone-disabled-symbolic",
+    (True, True): "changes-prevent-symbolic",
+}
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def boot_id():
+    with open("/proc/sys/kernel/random/boot_id") as f:
+        return f.read().strip()
+
+
+def targets_label(devices):
+    return " and ".join(NAMES[d] for d in devices)
+
+
+class Tray:
+    def __init__(self):
+        Notify.init(APP_ID)
+        self.state = None
+        self.pin_set = None
+        self.busy = False
+        self.last_unlock_notice = 0
+        self.ind = AppIndicator.Indicator.new(
+            APP_ID, ICONS[(False, False)], AppIndicator.IndicatorCategory.HARDWARE)
+        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.ind.set_title("Camera & Mic Lock")
+        self.refresh()
+        GLib.timeout_add_seconds(2, self.refresh)
+        GLib.idle_add(self.show_login_notice)
+        self.watch_screen_unlock()
+
+    # ------------------------------------------------------------ state
+
+    def refresh(self):
+        state = read_json(STATE_FILE, {})
+        pin_set = os.path.exists(PIN_FILE)
+        if state != self.state or pin_set != self.pin_set:
+            self.state, self.pin_set = state, pin_set
+            self.ind.set_icon_full(
+                ICONS[("camera" in state, "mic" in state)], "privacy-lock")
+            self.ind.set_menu(self.build_menu())
+        # The blocks a restart lifts are released only at login, possibly
+        # after this menu started.
+        if os.path.exists(LOGIN_MARKER):
+            self.show_boot_notice()
+        return True
+
+    def show_login_notice(self):
+        """At login: say a restart lifted the blocks, or else show the status."""
+        if self.show_boot_notice():
+            open(LOGIN_MARKER, "w").close()
+        elif not os.path.exists(LOGIN_MARKER):
+            open(LOGIN_MARKER, "w").close()
+            self.notify_status()
+        return False
+
+    def show_boot_notice(self):
+        """Once per boot, if the restart lifted blocks. Returns True if shown."""
+        notice = read_json(BOOT_NOTICE, None)
+        if not notice or notice.get("boot_id") != boot_id():
+            return False
+        if read_json(NOTIFIED_FILE, None) == notice["boot_id"]:
+            return False
+        os.makedirs(os.path.dirname(NOTIFIED_FILE), exist_ok=True)
+        with open(NOTIFIED_FILE, "w") as f:
+            json.dump(notice["boot_id"], f)
+        devices = [d for d in notice.get("unblocked", []) if d in NAMES]
+        if not devices:
+            return False
+        verb = "are" if len(devices) > 1 else "is"
+        self.notify(f"{targets_label(devices)} unblocked",
+                    f"The PC was restarted, so your {targets_label(devices).lower()} "
+                    f"{verb} unblocked and available to apps again.")
+        return True
+
+    def notify_status(self):
+        state = read_json(STATE_FILE, {})
+        blocked = [d for d in ("camera", "mic") if d in state]
+        unblocked = [d for d in ("camera", "mic") if d not in state]
+        if not blocked:
+            self.notify("Camera and microphone are unblocked",
+                        "Apps can use them. Block them from the lock icon in the top bar.",
+                        "changes-allow-symbolic")
+            return
+        lines = []
+        for d in blocked:
+            how = {"restart": "until restart", "login": "until login"}.get(
+                state[d]["mode"], "PIN to unblock")
+            lines.append(f"{NAMES[d]}: BLOCKED ({how})")
+        lines += [f"{NAMES[d]}: unblocked" for d in unblocked]
+        title = ("Camera and microphone are blocked" if not unblocked
+                 else f"{targets_label(blocked)} is blocked")
+        self.notify(title, "\n".join(lines))
+
+    def watch_screen_unlock(self):
+        """Show the status again every time the screen is unlocked.
+
+        Every desktop sends ActiveChanged(false) on unlock, each under its own
+        name: org.gnome.ScreenSaver, org.freedesktop.ScreenSaver (KDE, XFCE,
+        LXQt), org.cinnamon.ScreenSaver, org.mate.ScreenSaver. Listen to all of
+        them; some send more than one, so a second notice within 5 s is skipped."""
+        def on_signal(_conn, _sender, _path, iface, _signal, params):
+            if not iface.endswith("ScreenSaver"):
+                return
+            try:
+                active = params.unpack()[0]
+            except (IndexError, TypeError):
+                return
+            if not active and time.monotonic() - self.last_unlock_notice > 5:
+                self.last_unlock_notice = time.monotonic()
+                self.notify_status()
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            bus.signal_subscribe(None, None, "ActiveChanged", None, None,
+                                 Gio.DBusSignalFlags.NONE, on_signal)
+        except GLib.Error:
+            pass  # no session bus: the login notice still works
+
+    # ------------------------------------------------------------ menu
+
+    def build_menu(self):
+        menu = Gtk.Menu()
+
+        for d in ("camera", "mic"):
+            entry = self.state.get(d)
+            if entry is None:
+                text = f"{NAMES[d]}: ON"
+            elif entry["mode"] == "restart":
+                text = f"{NAMES[d]}: BLOCKED (until restart)"
+            elif entry["mode"] == "login":
+                text = f"{NAMES[d]}: BLOCKED (until login)"
+            else:
+                text = f"{NAMES[d]}: BLOCKED (PIN to unlock)"
+            item = Gtk.MenuItem(label=text)
+            item.set_sensitive(False)
+            menu.append(item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        if not self.pin_set:
+            self.add_item(menu, "Set up PIN…", self.on_setup_pin)
+            menu.show_all()
+            return menu
+
+        open_devs = [d for d in ("camera", "mic") if d not in self.state]
+        pin_devs = [d for d in ("camera", "mic") if self.state.get(d, {}).get("mode") == "pin"]
+
+        for d in open_devs:
+            self.add_item(menu, f"Block {NAMES[d].lower()}…", self.on_block, [d])
+        if len(open_devs) == 2:
+            self.add_item(menu, "Block camera and microphone…", self.on_block, open_devs)
+
+        if open_devs and pin_devs:
+            menu.append(Gtk.SeparatorMenuItem())
+
+        for d in pin_devs:
+            self.add_item(menu, f"Unblock {NAMES[d].lower()}…", self.on_unblock, [d])
+        if len(pin_devs) == 2:
+            self.add_item(menu, "Unblock camera and microphone…", self.on_unblock, pin_devs)
+
+        if any(e["mode"] == "restart" for e in self.state.values()):
+            item = Gtk.MenuItem(label="Restart the PC to unblock the rest")
+            item.set_sensitive(False)
+            menu.append(item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        self.add_item(menu, "Change PIN…", self.on_change_pin)
+        self.add_item(menu, "Forgot PIN…", self.on_forgot_pin)
+        self.add_item(menu, "Turn off Camera & Mic Lock…", self.on_remove)
+
+        # Deliberately no "Quit" item: the menu must always stay in the top bar.
+        menu.show_all()
+        return menu
+
+    def add_item(self, menu, label, handler, *args):
+        item = Gtk.MenuItem(label=label)
+        item.connect("activate", handler, *args)
+        item.set_sensitive(not self.busy)
+        menu.append(item)
+
+    # ------------------------------------------------------------ actions
+
+    def on_block(self, _item, devices):
+        mode = self.ask_block_mode(devices)
+        if mode is None:
+            return
+        pins = self.ask_pins(f"Block {targets_label(devices).lower()}", ["Enter your PIN:"])
+        if pins is None:
+            return
+        target = "all" if len(devices) == 2 else devices[0]
+        args = [target, "off"] + (["--restart-only"] if mode == "restart" else [])
+        # PIN checked first; only if it is right does the system ask for the password.
+        self.run_helper(HELPER, args, pins, f"{targets_label(devices)} blocked",
+                        check_pin=pins[0], lockout_ok=True)
+
+    def on_unblock(self, _item, devices):
+        pins = self.ask_pins(f"Unblock {targets_label(devices).lower()}", ["Enter your PIN:"])
+        if pins is None:
+            return
+        target = "all" if len(devices) == 2 else devices[0]
+        # PIN checked first; only if it is right does the system ask for the password.
+        self.run_helper(HELPER, [target, "on"], pins, f"{targets_label(devices)} unblocked",
+                        check_pin=pins[0])
+
+    def on_setup_pin(self, _item):
+        pins = self.ask_new_pin("Set up PIN", [])
+        if pins is not None:
+            # The system asks for the computer password before the PIN is saved.
+            self.run_helper(PIN_HELPER, ["setup"], pins, "PIN set up")
+
+    def on_change_pin(self, _item):
+        pins = self.ask_new_pin("Change PIN", ["Current PIN:"])
+        if pins is not None:
+            self.run_helper(PIN_HELPER, ["change-pin"], pins, "PIN changed", check_pin=pins[0])
+
+    def on_forgot_pin(self, _item):
+        if self.state:
+            # The engine refuses too; this only explains the way back in.
+            dlg = Gtk.MessageDialog(
+                message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK,
+                text="Forgot PIN")
+            dlg.format_secondary_text(
+                "Forgot PIN can only be used while nothing is blocked.\n\n"
+                "To unblock without the PIN: enter 5 wrong PINs, then restart the PC "
+                "within the hour and log in. Then use Forgot PIN to set a new one.")
+            dlg.set_keep_above(True)
+            dlg.run()
+            dlg.destroy()
+            return
+        pins = self.ask_new_pin("Forgot PIN", [])
+        if pins is not None:
+            # No old PIN: the system asks for the computer password instead.
+            self.run_helper(PIN_HELPER, ["reset-pin"], pins, "New PIN set")
+
+    def on_remove(self, _item):
+        dlg = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Turn off Camera & Mic Lock?")
+        dlg.format_secondary_text(
+            "This removes your PIN, unblocks the camera and microphone, and uninstalls "
+            "the lock. You will need your computer password and your PIN.")
+        dlg.set_keep_above(True)
+        resp = dlg.run()
+        dlg.destroy()
+        if resp != Gtk.ResponseType.OK:
+            return
+        pins = self.ask_pins("Turn off Camera & Mic Lock", ["Enter your PIN:"])
+        if pins is not None:
+            # On success the remover itself notifies and stops this menu.
+            self.run_helper(PIN_HELPER, ["remove"], pins, None, check_pin=pins[0])
+
+    def ask_new_pin(self, title, first_fields):
+        pins = self.ask_pins(title, first_fields + [
+            f"New PIN (digits, at least {MIN_PIN_LEN}):", "Repeat new PIN:"])
+        if pins is None:
+            return None
+        new, repeat = pins[-2:]
+        if not new.isdigit() or len(new) < MIN_PIN_LEN:
+            self.error_dialog(f"The PIN must be at least {MIN_PIN_LEN} digits.")
+            return None
+        if new != repeat:
+            self.error_dialog("The new PINs do not match.")
+            return None
+        return pins
+
+    def run_helper(self, helper, args, stdin_lines, success_title,
+                   check_pin=None, lockout_ok=False):
+        self.busy = True
+        self.ind.set_menu(self.build_menu())
+
+        def pkexec(cmd, lines):
+            try:
+                r = subprocess.run(["pkexec"] + cmd,
+                                   input="".join(line + "\n" for line in lines),
+                                   capture_output=True, text=True, timeout=120)
+                return (r.returncode, r.stdout.strip(), r.stderr.strip())
+            except Exception as e:  # pkexec missing, timeout, ...
+                return (1, "", str(e))
+
+        def work():
+            result = None
+            if check_pin is not None:
+                # Step 1: the PIN. Only if it is right does step 2 (the system's
+                # computer-password dialog, from pkexec below) appear.
+                result = pkexec([PIN_CHECK], [check_pin])
+                if result[0] == 0 or (result[0] == EXIT_LOCKED_OUT and lockout_ok):
+                    result = None
+            if result is None:
+                result = pkexec([helper] + args, stdin_lines)
+            GLib.idle_add(self.helper_done, result, success_title)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def helper_done(self, result, success_title):
+        code, out, err = result
+        self.busy = False
+        self.state = None  # force a menu rebuild
+        self.refresh()
+        if code == 0:
+            if success_title:
+                self.notify(success_title, out)
+        elif code == 126:
+            pass  # computer-password dialog dismissed
+        elif code == 127:
+            self.error_dialog("Your computer password was not accepted.")
+        else:
+            self.error_dialog(err or out or f"Failed (exit code {code}).")
+        return False
+
+    # ------------------------------------------------------------ dialogs
+
+    def ask_block_mode(self, devices):
+        dlg = Gtk.Dialog(title=f"Block {targets_label(devices).lower()}", modal=True)
+        dlg.set_keep_above(True)
+        dlg.set_position(Gtk.WindowPosition.CENTER)
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Block", Gtk.ResponseType.OK).get_style_context().add_class(
+            "destructive-action")
+        box = dlg.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        box.add(Gtk.Label(label=f"How should the {targets_label(devices).lower()} "
+                                f"be unblocked later?", xalign=0))
+        pin_btn = Gtk.RadioButton.new_with_label(
+            None, "With my PIN")
+        restart_btn = Gtk.RadioButton.new_with_label_from_widget(
+            pin_btn, "Only by restarting the PC")
+        box.add(pin_btn)
+        box.add(restart_btn)
+        dlg.show_all()
+        resp = dlg.run()
+        mode = "restart" if restart_btn.get_active() else "pin"
+        dlg.destroy()
+        return mode if resp == Gtk.ResponseType.OK else None
+
+    def ask_pins(self, title, labels):
+        """Hidden-text PIN fields, one per label. Returns the values or None."""
+        dlg = Gtk.Dialog(title=title, modal=True)
+        dlg.set_keep_above(True)
+        dlg.set_position(Gtk.WindowPosition.CENTER)
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        ok = dlg.add_button("OK", Gtk.ResponseType.OK)
+        ok.get_style_context().add_class("suggested-action")
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(16)
+        entries = []
+        for label in labels:
+            box.add(Gtk.Label(label=label, xalign=0))
+            entry = Gtk.Entry(visibility=False, input_purpose=Gtk.InputPurpose.PIN,
+                              activates_default=True)
+            box.add(entry)
+            entries.append(entry)
+        dlg.show_all()
+        resp = dlg.run()
+        pins = [e.get_text() for e in entries]
+        dlg.destroy()
+        if resp != Gtk.ResponseType.OK or not all(pins):
+            return None
+        return pins
+
+    def error_dialog(self, text):
+        dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.ERROR,
+                                buttons=Gtk.ButtonsType.OK, text="Camera & Mic Lock")
+        dlg.format_secondary_text(text)
+        dlg.set_keep_above(True)
+        dlg.run()
+        dlg.destroy()
+
+    def notify(self, title, body, icon="changes-prevent-symbolic"):
+        n = Notify.Notification.new(title, body, icon)
+        try:
+            n.show()
+        except GLib.Error:
+            pass
+
+
+def supervise():
+    """Keep the menu running where no systemd user service does it (OpenRC):
+    start it again whenever it exits, like Restart=always."""
+    while True:
+        started = time.monotonic()
+        subprocess.run([sys.executable, os.path.realpath(__file__)])
+        # Another copy already runs: it exits at once. Back off, keep watching.
+        time.sleep(2 if time.monotonic() - started > 10 else 30)
+
+
+def main():
+    if sys.argv[1:] == ["--supervise"]:
+        supervise()
+        return
+    # Only one tray per session.
+    lock_path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "privacy-lock-tray.lock")
+    lock = open(lock_path, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    Tray()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,13 @@
+[Unit]
+Description=Camera & Mic Lock top-bar menu
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/privacy-lock-tray
+# Always come back if it is closed, killed or crashes.
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

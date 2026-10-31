@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+"""
+privacy-lock (Linux) - PIN-protected kill switches for the camera and the microphone.
+
+The rules (PIN, lockout, block modes, restart) live in privacy_lock_core.py,
+shared with Windows and macOS. This file does the Linux side, as root, so
+normal programs cannot undo it:
+
+  camera: the uvcvideo driver is unloaded and forbidden from loading, and every
+          /dev/video*, /dev/media* and /dev/v4l-subdev* node is set to mode 0000
+          with the desktop-session ACLs stripped (also for cameras plugged in
+          later). MIPI cameras (Intel IPU6 and similar) keep their driver
+          loaded, but their nodes are blocked the same way.
+  mic:    every ALSA capture node /dev/snd/pcmC*D*c is set to mode 0000 with
+          ACLs stripped (also for mics plugged in later), the hardware capture
+          switch is turned off, and PipeWire or PulseAudio is restarted so it
+          lets go of any handle it already had open.
+
+All block files live in /run, which is wiped on every restart; at boot the
+previous blocks are re-applied: PIN blocks as they were (unless the lockout is
+active), the rest with mode "login", lifted at the first local login.
+Works with systemd and with OpenRC + elogind.
+"""
+
+import getpass
+import glob
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+import time
+
+# The shared rules: installed next to the engine, or found in the source tree.
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in ("/usr/local/lib/privacy-lock", os.path.join(_here, "..", "common")):
+    if os.path.exists(os.path.join(_lib, "privacy_lock_core.py")):
+        sys.path.insert(0, _lib)
+        break
+import privacy_lock_core as core  # noqa: E402
+
+CONF_DIR = "/etc/privacy-lock"
+RUN_DIR = "/run/privacy-lock"
+VAR_DIR = "/var/lib/privacy-lock"
+OLD_ATTEMPTS = os.path.join(RUN_DIR, "attempts.json")  # used before the counter survived restarts
+
+CAM_MODPROBE = "/run/modprobe.d/privacy-lock-camera.conf"
+CAM_UDEV = "/run/udev/rules.d/72-privacy-lock-camera.rules"
+MIC_UDEV = "/run/udev/rules.d/72-privacy-lock-mic.rules"
+
+# Files used by the first version, which kept the block across restarts.
+LEGACY_FILES = {
+    "camera": ["/etc/modprobe.d/privacy-lock-camera.conf",
+               "/etc/udev/rules.d/72-privacy-lock-camera.rules"],
+    "mic": ["/etc/udev/rules.d/72-privacy-lock-mic.rules"],
+}
+LEGACY_ATTEMPTS = os.path.join(CONF_DIR, "attempts.json")
+
+# Runs after 70-uaccess.rules adds the tag and before 73-seat-late.rules turns
+# the tag into a desktop-user ACL, so the logged-in user never gets access.
+# video4linux also covers v4l-subdev nodes (MIPI / IPU6 sensors).
+CAM_UDEV_RULE = (
+    'SUBSYSTEM=="video4linux", MODE="0000", OWNER="root", GROUP="root", TAG-="uaccess"\n'
+    'SUBSYSTEM=="media", MODE="0000", OWNER="root", GROUP="root", TAG-="uaccess"\n'
+)
+MIC_UDEV_RULE = (
+    'SUBSYSTEM=="sound", KERNEL=="pcmC[0-9]*D[0-9]*c", '
+    'MODE="0000", OWNER="root", GROUP="root", TAG-="uaccess"\n'
+)
+
+INSTALLED_FILES = [
+    "/usr/local/sbin/privacy-lock", "/usr/local/bin/privacy-lock",
+    "/usr/local/lib/privacy-lock/privacy_lock_core.py",
+    "/usr/local/libexec/privacy-lock-helper", "/usr/local/libexec/privacy-lock-pin-helper",
+    "/usr/local/libexec/privacy-lock-pin-check",
+    "/usr/local/bin/privacy-lock-tray",
+    "/usr/share/polkit-1/actions/io.github.saiftherehman.privacylock.policy",
+    "/etc/systemd/system/privacy-lock-boot.service",
+    "/etc/systemd/system/privacy-lock-login.service",
+    "/etc/systemd/user/privacy-lock-tray.service",
+    "/etc/init.d/privacy-lock-boot", "/etc/init.d/privacy-lock-login",
+    "/usr/share/applications/privacy-lock-tray.desktop",
+    "/etc/xdg/autostart/privacy-lock-tray.desktop",
+]
+
+
+# ---------------------------------------------------------------- helpers
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:  # tool not installed (e.g. no systemctl on OpenRC)
+        return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: not found")
+
+
+def has_systemd():
+    return os.path.isdir("/run/systemd/system")
+
+
+def write_file(path, content, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(content)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def remove(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def reload_udev(subsystem):
+    run(["udevadm", "control", "--reload"])
+    run(["udevadm", "trigger", "--action=change", f"--subsystem-match={subsystem}"])
+    run(["udevadm", "settle", "--timeout=5"])
+
+
+def harden_nodes(paths):
+    """Apply the block immediately, without waiting for udev."""
+    for p in paths:
+        try:
+            run(["setfacl", "-b", p])
+            os.chown(p, 0, 0)
+            os.chmod(p, 0)
+        except FileNotFoundError:
+            pass
+
+
+def holders(paths):
+    """PIDs that currently have any of these device nodes open."""
+    pids = set()
+    targets = {os.path.realpath(p) for p in paths}
+    for fd_dir in glob.glob("/proc/[0-9]*/fd"):
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    if os.readlink(os.path.join(fd_dir, fd)) in targets:
+                        pids.add(int(fd_dir.split("/")[2]))
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    pids.discard(os.getpid())
+    return pids
+
+
+def proc_info(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            comm = f.read().strip()
+        return comm, os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        return None, None
+
+
+AUDIO_DAEMONS = {"pipewire", "wireplumber", "pipewire-pulse", "pulseaudio"}
+
+
+def restart_user_audio(uids):
+    """Restart PipeWire (or PulseAudio) for each user so it drops / rediscovers devices."""
+    for uid in uids:
+        try:
+            name = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            continue
+        user_ctl = ["systemctl", "--user", f"--machine={name}@"]
+        if run(user_ctl + ["restart", "pipewire", "pipewire-pulse", "wireplumber"]).returncode == 0:
+            continue
+        if run(user_ctl + ["restart", "pulseaudio.service"]).returncode == 0:
+            continue
+        # No user units (OpenRC, or started by the desktop): kill them. Socket
+        # activation, the session manager or PulseAudio autospawn brings them back.
+        run(["pkill", "-u", str(uid), "-x", "wireplumber|pipewire|pipewire-pulse|pulseaudio"])
+
+
+def desktop_uids():
+    uids = set()
+    for p in glob.glob("/run/user/[0-9]*"):
+        try:
+            uid = int(os.path.basename(p))
+        except ValueError:
+            continue
+        if uid >= 1000:
+            uids.add(uid)
+    return uids
+
+
+def release_devices(paths, label):
+    """Close every handle to the given nodes: restart audio daemons, kill the rest."""
+    audio_uids, killed = set(), []
+    for pid in holders(paths):
+        comm, uid = proc_info(pid)
+        if comm is None:
+            continue
+        if comm in AUDIO_DAEMONS:
+            audio_uids.add(uid)
+        else:
+            try:
+                os.kill(pid, 15)
+                killed.append(f"{comm}({pid})")
+            except ProcessLookupError:
+                pass
+    if audio_uids:
+        restart_user_audio(audio_uids)
+    if killed:
+        print(f"  closed programs that were using the {label}: {', '.join(killed)}")
+        time.sleep(1)
+        for pid in holders(paths):
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+
+
+def leaky_nodes(paths):
+    """Nodes that are supposed to be blocked but still grant someone access."""
+    leaky = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except FileNotFoundError:
+            continue
+        acl = run(["getfacl", "-cp", p]).stdout
+        if st.st_mode & 0o777 or "user:" in acl.replace("user::", ""):
+            leaky.append(p)
+    return leaky
+
+
+# ---------------------------------------------------------------- camera
+
+def camera_nodes():
+    return glob.glob("/dev/video*") + glob.glob("/dev/media*") + glob.glob("/dev/v4l-subdev*")
+
+
+def block_camera():
+    write_file(CAM_MODPROBE,
+               "# privacy-lock: camera blocked until PIN unlock or restart\n"
+               "install uvcvideo /bin/false\n")
+    write_file(CAM_UDEV, CAM_UDEV_RULE)
+    # Reload udev first: a change event processed with the old rules would
+    # re-add the desktop user's ACL after we strip it.
+    reload_udev("video4linux")
+    reload_udev("media")
+    nodes = camera_nodes()
+    harden_nodes(nodes)
+    # PipeWire may grab the camera again while it restarts, so retry.
+    err = ""
+    for _ in range(5):
+        release_devices(nodes, "camera")
+        r = run(["modprobe", "-r", "uvcvideo"])
+        if r.returncode == 0 or "not currently loaded" in r.stderr or "not found" in r.stderr:
+            err = ""
+            break
+        err = r.stderr.strip()
+        time.sleep(1)
+    harden_nodes(camera_nodes())
+    if err:
+        print(f"  note: driver still loaded ({err}); device nodes are blocked anyway")
+
+
+def unblock_camera():
+    remove(CAM_MODPROBE)
+    remove(CAM_UDEV)
+    run(["modprobe", "uvcvideo"])
+    reload_udev("video4linux")
+    reload_udev("media")
+
+
+# ---------------------------------------------------------------- mic
+
+def capture_nodes():
+    return glob.glob("/dev/snd/pcmC*D*c")
+
+
+def set_capture_switch(enabled):
+    cards = {os.path.basename(p)[4:].split("D")[0] for p in capture_nodes()}
+    for c in sorted(cards):
+        for ctl in ("Capture", "Mic", "Internal Mic", "Headset Mic"):
+            run(["amixer", "-q", "-c", c, "sset", ctl, "cap" if enabled else "nocap"])
+
+
+def block_mic():
+    write_file(MIC_UDEV, MIC_UDEV_RULE)
+    nodes = capture_nodes()
+    harden_nodes(nodes)
+    set_capture_switch(False)
+    reload_udev("sound")
+    harden_nodes(capture_nodes())
+    release_devices(nodes, "microphone")
+    harden_nodes(capture_nodes())
+
+
+def unblock_mic():
+    remove(MIC_UDEV)
+    reload_udev("sound")
+    # A change event re-adds the session ACL but not owner/mode, so copy those
+    # back from the card's playback node, which was never touched.
+    for node in capture_nodes():
+        ref = glob.glob(node.rsplit("D", 1)[0] + "D*p")
+        if ref:
+            st = os.stat(ref[0])
+            os.chown(node, st.st_uid, st.st_gid)
+            os.chmod(node, st.st_mode & 0o777)
+    set_capture_switch(True)
+
+
+# ---------------------------------------------------------------- account security
+#
+# The computer's login password is the backup proof that the person changing
+# the PIN or unblocking is the real owner. These checks only look at whether a
+# password exists and is required; the password itself is never read.
+
+def config_lines(patterns):
+    """Non-comment lines of every file matching the glob patterns."""
+    for pattern in patterns:
+        for path in sorted(glob.glob(pattern)):
+            try:
+                with open(path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith(("#", ";")):
+                            yield line
+            except OSError:
+                continue
+
+
+def autologin_enabled():
+    for line in config_lines(["/etc/gdm3/custom.conf", "/etc/gdm/custom.conf"]):
+        key, _, value = line.partition("=")
+        if key.strip() in ("AutomaticLoginEnable", "TimedLoginEnable") \
+                and value.strip().lower() in ("true", "1", "yes"):
+            return True
+    for line in config_lines(["/etc/lightdm/lightdm.conf", "/etc/lightdm/lightdm.conf.d/*.conf",
+                              "/usr/share/lightdm/lightdm.conf.d/*.conf"]):
+        key, _, value = line.partition("=")
+        if key.strip() == "autologin-user" and value.strip():
+            return True
+    section = ""
+    for line in config_lines(["/etc/sddm.conf", "/etc/sddm.conf.d/*.conf"]):
+        if line.startswith("["):
+            section = line
+        elif section == "[Autologin]" and line.partition("=")[0].strip() == "User" \
+                and line.partition("=")[2].strip():
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- platform
+
+class LinuxPlatform(core.Platform):
+    computer = "PC"
+    fix_hint = ("Fix it first: Settings > System > Users > set a Password and turn OFF\n"
+                "Automatic Login.")
+
+    pin_file = os.path.join(CONF_DIR, "pin.json")
+    state_file = os.path.join(RUN_DIR, "state.json")         # world-readable, read by the tray
+    boot_notice = os.path.join(RUN_DIR, "boot-notice.json")  # world-readable, read by the tray
+    # Survive a restart: what was blocked (and how), and the wrong-PIN counter.
+    was_blocked = os.path.join(VAR_DIR, "was-blocked.json")
+    attempts_file = os.path.join(VAR_DIR, "attempts.json")
+
+    def __init__(self, gui=False):
+        # gui: PINs come from the tray dialog on stdin, and pkexec already made
+        # the system ask for the computer password.
+        self.gui = gui
+        self.interactive = not gui
+
+    # -- files
+    def write_private(self, path, text):
+        if path == self.pin_file:
+            os.makedirs(CONF_DIR, exist_ok=True)
+            os.chmod(CONF_DIR, 0o755)
+        write_file(path, text, 0o600)
+
+    def write_public(self, path, text):
+        os.makedirs(RUN_DIR, exist_ok=True)
+        os.chmod(RUN_DIR, 0o755)
+        write_file(path, text, 0o644)
+
+    # -- devices
+    def block(self, device):
+        {"camera": block_camera, "mic": block_mic}[device]()
+
+    def unblock(self, device):
+        {"camera": unblock_camera, "mic": unblock_mic}[device]()
+
+    def leaks(self, device):
+        return leaky_nodes(camera_nodes() if device == "camera" else capture_nodes())
+
+    def after_change(self, extra_users=()):
+        uids = desktop_uids()
+        for u in extra_users:
+            try:
+                uids.add(pwd.getpwnam(u).pw_uid)
+            except KeyError:
+                pass
+        restart_user_audio(uids)  # PipeWire also brokers camera access
+
+    # -- people and passwords
+    def real_user(self):
+        """The person behind sudo / pkexec."""
+        if os.environ.get("PKEXEC_UID"):
+            return pwd.getpwuid(int(os.environ["PKEXEC_UID"])).pw_name
+        return os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
+
+    def security_problems(self, user):
+        problems = []
+        if user != "root":
+            field = None
+            with open("/etc/shadow") as f:
+                for line in f:
+                    name, _, rest = line.partition(":")
+                    if name == user:
+                        field = rest.split(":", 1)[0]
+                        break
+            # Only the format is checked: "$..." is a password hash; "" means no
+            # password; "!" / "*" mean password login is disabled.
+            if not field:
+                problems.append(f"The account '{user}' has no password.")
+            elif not field.startswith("$"):
+                problems.append(f"The account '{user}' has no usable password "
+                                "(it is disabled or locked).")
+            sudo_rules = run(["sudo", "-l", "-U", user]).stdout
+            if "NOPASSWD" in sudo_rules:
+                problems.append(f"'{user}' can run admin (sudo) commands without a password.")
+        if autologin_enabled():
+            problems.append("Automatic login is turned on, so the PC starts without "
+                            "asking for a password.")
+        return problems
+
+    def confirm_account_password(self):
+        """Ask for the computer's own login password (checked by the system, not stored)."""
+        if self.gui:
+            return  # the tray's pkexec call already made the system ask for it
+        user = self.real_user()
+        if user == "root":
+            return
+        print(f"Confirm it's you: enter the computer login password for '{user}'.")
+        # `su` to your own account always asks for your password via PAM.
+        if subprocess.run(["runuser", "-u", user, "--", "su", user, "-c", "true"]).returncode != 0:
+            raise core.Fail("Computer password not accepted.")
+
+    def read_pin(self, prompt):
+        if self.gui:
+            return sys.stdin.readline().strip()
+        # getpass reads from /dev/tty, never from stdin, so a program cannot pipe
+        # the PIN in. Additionally refuse to run when there is no terminal at all.
+        if not os.isatty(0) or not os.path.exists("/dev/tty"):
+            raise core.Fail("The PIN must be typed by hand in a terminal or in the tray dialog.")
+        try:
+            return getpass.getpass(prompt)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            raise core.Fail("Cancelled.")
+
+    def say(self, text):
+        if not self.gui:
+            print(text)
+
+    # -- restart
+    def boot_id(self):
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+
+    def local_login_user(self):
+        """A user logged in at this computer's own screen or console, if any.
+
+        logind (or elogind) only creates a "user"-class session on a seat after
+        PAM accepted the login (the password); the login screen itself is a
+        "greeter" session, and SSH / lingering sessions have no seat."""
+        lines = run(["loginctl", "list-sessions", "--no-legend"]).stdout.splitlines()
+        for sid in (line.split()[0] for line in lines if line.strip()):
+            props = dict(line.partition("=")[::2] for line in run(
+                ["loginctl", "show-session", sid, "-p", "Class", "-p", "Seat",
+                 "-p", "Remote", "-p", "User", "-p", "State"]).stdout.splitlines())
+            if props.get("Class") == "user" and props.get("Seat") \
+                    and props.get("Remote") == "no" and props.get("State") in ("active", "online") \
+                    and props.get("User", "").isdigit() and int(props["User"]) >= 1000:
+                uid = int(props["User"])
+                try:
+                    return pwd.getpwuid(uid).pw_name
+                except KeyError:
+                    return f"uid {uid}"
+        return None
+
+    # -- turn off
+    def uninstall(self):
+        for path in (CONF_DIR, RUN_DIR, VAR_DIR, "/usr/local/lib/privacy-lock"):
+            shutil.rmtree(path, ignore_errors=True)
+        systemd = has_systemd()
+        if systemd:
+            run(["systemctl", "disable", "privacy-lock-boot.service", "privacy-lock-login.service"])
+            run(["systemctl", "--global", "disable", "privacy-lock-tray.service"])
+        else:
+            for svc in ("privacy-lock-boot", "privacy-lock-login"):
+                run(["rc-update", "del", svc, "default"])
+                run(["rc-update", "del", svc, "boot"])
+        for path in INSTALLED_FILES:
+            remove(path)
+        if systemd:
+            run(["systemctl", "daemon-reload"])
+        for uid in desktop_uids():
+            name = pwd.getpwuid(uid).pw_name
+            if systemd:
+                run(["systemctl", "--user", f"--machine={name}@", "stop", "--no-block",
+                     "privacy-lock-tray.service"])
+                run(["systemctl", "--user", f"--machine={name}@", "daemon-reload"])
+            run(["pkill", "-u", str(uid), "-f", "/usr/local/bin/privacy-lock-tray"])
+
+    def notify_all(self, title, body):
+        """Show a desktop notification to every logged-in user (from root)."""
+        for uid in desktop_uids():
+            try:
+                name = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                continue
+            run(["runuser", "-u", name, "--", "env",
+                 f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+                 "notify-send", "-i", "changes-allow-symbolic", title, body])
+
+
+def cmd_migrate(engine):
+    """Move blocks made by the first version (kept in /etc) to /run, and the
+    wrong-PIN counter from /run to /var/lib."""
+    p = engine.p
+    remove(LEGACY_ATTEMPTS)
+    if os.path.exists(OLD_ATTEMPTS):
+        if not os.path.exists(p.attempts_file):
+            engine.save_attempts(engine.load_json(OLD_ATTEMPTS, {"fails": 0, "locked_until": 0}))
+        remove(OLD_ATTEMPTS)
+    for d, files in LEGACY_FILES.items():
+        if any(os.path.exists(f) for f in files):
+            for f in files:
+                remove(f)
+            engine.block([d], restart_only=False)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    args = sys.argv[1:]
+    # --gui comes from the block/unblock helper and --gui-pin from the PIN
+    # helper, which the system only runs after the user typed their computer
+    # password; --gui-check from the PIN-check helper (no password), which the
+    # tray runs first so a wrong PIN is refused before the password is asked.
+    flag = args[0] if args[:1] in (["--gui"], ["--gui-pin"], ["--gui-check"]) else None
+    if flag:
+        args = args[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        core.usage(0)
+
+    cmd = args[0]
+    if cmd != "status" and os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", os.path.realpath(sys.argv[0])] + sys.argv[1:])
+
+    if flag and (cmd in ("boot", "wait-login", "migrate", "check", "status")
+                 or (cmd in ("setup", "change-pin", "reset-pin", "remove")) != (flag == "--gui-pin")
+                 or (cmd == "check-pin") != (flag == "--gui-check")):
+        print("Not available from the tray.", file=sys.stderr)
+        sys.exit(core.EXIT_ERROR)
+
+    platform = LinuxPlatform(gui=bool(flag))
+    if cmd == "migrate":
+        cmd_migrate(core.Engine(platform))
+        return
+    core.main(platform, args)
+
+
+if __name__ == "__main__":
+    main()

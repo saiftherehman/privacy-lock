@@ -1,0 +1,10 @@
+#!/bin/sh
+# Entry point for "Block" / "Unblock" in the tray, run through pkexec. The tray
+# first checks the PIN with privacy-lock-pin-check; then the system asks for the
+# user's own computer password every time before this runs (see
+# io.github.saiftherehman.privacylock.policy). The PIN arrives again on stdin and is rechecked.
+case "$1" in
+    camera|mic|all) ;;
+    *) echo "Not allowed." >&2; exit 1 ;;
+esac
+exec /usr/local/sbin/privacy-lock --gui "$@"
