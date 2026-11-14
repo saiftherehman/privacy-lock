@@ -12,9 +12,10 @@ normal programs cannot undo it:
           later). MIPI cameras (Intel IPU6 and similar) keep their driver
           loaded, but their nodes are blocked the same way.
   mic:    every ALSA capture node /dev/snd/pcmC*D*c is set to mode 0000 with
-          ACLs stripped (also for mics plugged in later), the hardware capture
-          switch is turned off, and PipeWire or PulseAudio is restarted so it
-          lets go of any handle it already had open.
+          ACLs stripped, programs holding it are closed, then the node is
+          removed (also for mics plugged in later) so the speakers keep
+          working; the hardware capture switch is turned off and PipeWire or
+          PulseAudio is restarted. Unblock recreates the nodes from sysfs.
 
 All block files live in /run, which is wiped on every restart; at boot the
 previous blocks are re-applied: PIN blocks as they were (unless the lockout is
@@ -27,6 +28,7 @@ import glob
 import os
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -63,9 +65,13 @@ CAM_UDEV_RULE = (
     'SUBSYSTEM=="video4linux", MODE="0000", OWNER="root", GROUP="root", TAG-="uaccess"\n'
     'SUBSYSTEM=="media", MODE="0000", OWNER="root", GROUP="root", TAG-="uaccess"\n'
 )
+# PipeWire hides the whole sound card, speakers included, while any of its
+# pcm nodes is inaccessible, so blocked capture nodes are removed, not just
+# locked.
 MIC_UDEV_RULE = (
     'SUBSYSTEM=="sound", KERNEL=="pcmC[0-9]*D[0-9]*c", '
-    'MODE="0000", OWNER="root", GROUP="root", TAG-="uaccess"\n'
+    'MODE="0000", OWNER="root", GROUP="root", TAG-="uaccess", '
+    'RUN+="/bin/rm -f /dev/snd/%k"\n'
 )
 
 INSTALLED_FILES = [
@@ -277,8 +283,13 @@ def capture_nodes():
     return glob.glob("/dev/snd/pcmC*D*c")
 
 
+def capture_sysfs():
+    """Capture devices the kernel has, whether or not their /dev node exists."""
+    return glob.glob("/sys/class/sound/pcmC*D*c")
+
+
 def set_capture_switch(enabled):
-    cards = {os.path.basename(p)[4:].split("D")[0] for p in capture_nodes()}
+    cards = {os.path.basename(p)[4:].split("D")[0] for p in capture_sysfs()}
     for c in sorted(cards):
         for ctl in ("Capture", "Mic", "Internal Mic", "Headset Mic"):
             run(["amixer", "-q", "-c", c, "sset", ctl, "cap" if enabled else "nocap"])
@@ -293,10 +304,25 @@ def block_mic():
     harden_nodes(capture_nodes())
     release_devices(nodes, "microphone")
     harden_nodes(capture_nodes())
+    # A locked node would make PipeWire drop the speakers too, so remove it;
+    # after_change() then restarts PipeWire, which finds a playback-only card.
+    for node in capture_nodes():
+        remove(node)
 
 
 def unblock_mic():
     remove(MIC_UDEV)
+    run(["udevadm", "control", "--reload"])
+    for sys_dev in capture_sysfs():
+        node = "/dev/snd/" + os.path.basename(sys_dev)
+        if os.path.exists(node):
+            continue
+        try:
+            with open(os.path.join(sys_dev, "dev")) as f:
+                major, minor = map(int, f.read().split(":"))
+            os.mknod(node, stat.S_IFCHR | 0o600, os.makedev(major, minor))
+        except (OSError, ValueError):
+            continue
     reload_udev("sound")
     # A change event re-adds the session ACL but not owner/mode, so copy those
     # back from the card's playback node, which was never touched.

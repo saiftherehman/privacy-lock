@@ -69,8 +69,11 @@ PipeWire.
 The mic shares its sound card with the speakers, so the driver stays loaded.
 
 1. udev rule `/run/udev/rules.d/72-privacy-lock-mic.rules`: every ALSA
-   capture node `/dev/snd/pcmC*D*c` → mode `0000`, root, no `uaccess`.
-   Playback nodes are untouched.
+   capture node `/dev/snd/pcmC*D*c` → mode `0000`, root, no `uaccess`, then
+   removed (`RUN+="/bin/rm -f /dev/snd/%k"`), also for mics plugged in later.
+   Playback nodes are untouched. The node is removed rather than only locked
+   because PipeWire hides the whole card, speakers included, while any of its
+   pcm nodes is inaccessible ("Dummy Output", no sound).
 2. Same node hardening as the camera, before and after the udev reload.
 3. Hardware capture switch off via `amixer` (`Capture`, `Mic`, `Internal
    Mic`, `Headset Mic`), which also lights the mute LED on many laptops.
@@ -79,6 +82,10 @@ The mic shares its sound card with the speakers, so the driver stays loaded.
    `pulseaudio.service`, or, without user units (OpenRC, or started by the
    desktop), the processes are ended and come back by socket activation, the
    session or PulseAudio autospawn.
+5. After programs holding the mic are closed, the remaining capture nodes are
+   removed. Unblock recreates them with `mknod` from
+   `/sys/class/sound/pcmC*D*c/dev` before the udev reload, which restores
+   their owner, mode and session ACL.
 
 Unblock: remove the rule, reload udev, copy owner / group / mode back from the
 card's playback node (a `change` event restores the ACL but not the mode),

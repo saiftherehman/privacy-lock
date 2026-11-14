@@ -176,6 +176,7 @@ knows neither the PIN nor the computer password.
 | [docs/windows.md](docs/windows.md) | Windows implementation |
 | [docs/macos.md](docs/macos.md) | macOS implementation and its limits |
 | [docs/development.md](docs/development.md) | Project status, test checklist, known gaps, conventions |
+| [docs/security-review.md](docs/security-review.md) | Linux security review and its minor points |
 
 ## Project layout
 
